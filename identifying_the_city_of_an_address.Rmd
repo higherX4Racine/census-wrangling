@@ -1,0 +1,208 @@
+---
+title: "Identifying the City of an Address"
+author: "Ben Taft"
+date: "11/2/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+## Setup
+
+It looks like there may be a way to do this in one step with the Census' API.
+I will need some helper functions.
+
+```{r census_ceocoding_helpers}
+prepare_address <- function (address_string) {
+    address_string %>%
+        stringr::str_replace_all("[[:whitespace:]]", "+") %>%
+        URLencode()
+}
+
+kvp_or_null <- function(key, value) {
+    if (is.null(value)) {
+        return(NULL)
+    }
+    stringr::str_c(key, "=", value)
+}
+
+census_geo_api_query_address <- function(address,
+                                         city=NULL,
+                                         state=NULL,
+                                         zip_code=NULL) {
+
+    stringr::str_c(
+        kvp_or_null("street", prepare_address(address)),
+        kvp_or_null("city", city),
+        kvp_or_null("state", state),
+        kvp_or_null("zip", zip_code),
+        sep="&"
+    )
+
+}
+
+```
+
+```{r census_geocoding_api}
+geocoding <- list(
+    url         = "https://geocoding.geo.census.gov/geocoder",
+    return_type = "geographies",
+    search_type = "address",
+    benchmark   = "Public_AR_Current",
+    vintage     = "Current_Current",
+    format      = "json",
+    layers      = paste(# 80, # States
+                        # 82, # Counties
+                        28, # Incorporated Places
+                        29, # Incorporated Places Labels
+                        # 30, # Census Designated Places
+                        # 31, # Census Designated Labels
+                        sep=","
+    )
+)
+
+census_geo_api_base <- function(arg_list=geocoding) {
+    
+    with(geocoding,
+         stringr::str_c(url, "/", return_type, "/", search_type, "?",
+                        "benchmark=", benchmark,
+                        "&vintage=", vintage,
+                        "&format=", format,
+                        "&layers=", layers)
+    )
+}
+
+census_geo_api_call <- function (street,
+                                 city=NULL,
+                                 state=NULL,
+                                 zip=NULL) {
+    stringr::str_c(census_geo_api_base(),
+                   "&", census_geo_api_query_address(street,
+                                                     city,
+                                                     state,
+                                                     zip)
+    )
+}
+
+census_geo_parse_root <- function(.list) {
+    .list %>%
+        dplyr::tibble() %>%
+        tidyr::unnest_wider(".")
+}
+
+census_geo_unnest_list_column <- function(.tibble,
+                                          column_name) {
+    .tibble %>%
+        unnest_longer(column_name) %>%
+        unnest_wider(column_name)
+}
+
+census_geo_parse_stem <- function(.tibble,
+                                  stem_name="addressMatches") {
+    .list %>%
+        purrr::pluck(stem_name) %>%
+        dplyr::tibble() %>%
+        census_geo_unnest_list_column(".") %>%
+        select(!.data$addressComponents)
+}
+
+census_geo_parse_coords <- function (.tibble) {
+    .tibble %>%
+        tidyr::unnest_wider("coordinates") %>%
+        dplyr::rename(Longitude =.data$x,
+                      Latitude = .data$y)
+}
+
+census_geo_parse_tiger <- function (.tibble) {
+    .tibble %>% 
+        tidyr::unnest_wider("tigerLine")
+}
+
+
+census_geo_parse_place <- function (.tibble) {
+    .tibble %>% 
+        tidyr::unnest_wider("geographies") %>%
+        census_geo_unnest_list_column("Incorporated Places")
+}
+
+
+census_geo_list_to_tibble <- function (.list) {
+    .list %>%
+        census_geo_parse_root() %>%
+        census_geo_parse_stem() %>%
+        census_geo_parse_coords() %>%
+        census_geo_parse_tiger() %>%
+        census_geo_parse_place()
+}
+
+safe_read <- function (file_path) {
+    tryCatch(
+        file_path %>%
+            jsonlite::read_json() %>%
+            census_geo_list_to_tibble(),
+        error = function(e) tibble()
+    )
+}
+
+```
+
+The `census_geo_api_call` function gets A LOT of information from the API.
+In particular, each "Incorporated Places" geography has the census's full row of
+information about its place.
+
+```{r get_the_data}
+
+folks <- read_csv("~/Higher Expectations/RUSD/YWCA HSED/sanitized.csv",
+                  col_names=c("Index",
+                              "Address",
+                              "City",
+                              "State",
+                              "ZIP Code"),
+                  col_types = c(col_integer(),
+                                col_character(),
+                                col_character(),
+                                col_character(),
+                                col_integer())
+                  )
+
+peeps <- folks %>%
+    mutate(Tibble = map(census_geo_api_call(Address,
+                                            city="Racine",
+                                            state = "WI"),
+                        safe_read)) %>%
+    unnest_longer(.data$Tibble)
+
+peeps <- peeps %>%
+    select(!Tibble) %>%
+    bind_cols(peeps %>%
+                  pluck("Tibble")) %>%
+    filter(!is.na(matchedAddress)) %>%
+    select(Index,
+           matchedAddress,
+           Latitude,
+           Longitude,
+           tigerLineId,
+           side,
+           BASENAME) %>%
+    separate(matchedAddress,
+             into=c("Street",
+                    "City",
+                    "State",
+                    "ZIP code"),
+             sep="[[:space:]]*,[[:space:]]*",
+             convert=TRUE) %>%
+    mutate(City=BASENAME) %>%
+    select(!BASENAME) %>%
+    filter(!is.na(City)) %>%
+    distinct()
+
+folks %>%
+    select(Index,
+           Address) %>%
+    left_join(peeps) %>%
+    write_csv("Higher Expectations/RUSD/YWCA HSED/found.csv")
+
+```
